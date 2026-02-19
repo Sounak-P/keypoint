@@ -1,0 +1,16 @@
+name: keypoint-detection # to update an existing environment: conda env update -n <current_name> --file <path-to-this-file>
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pytorch=1.13
+  - pytorch-cuda=11.7
+  - torchvision
+  - mkl==2024.0 # bug, https://github.com/pytorch/pytorch/issues/123097
+  - pip
+  - pip:
+    - wandb>=0.13.7 # quick fix, gh actions failed to install wandb https://github.com/tlpss/keypoint-detection/actions/runs/3204224778/jobs/5235259475
+    - setuptools==70.0
+    - -e .

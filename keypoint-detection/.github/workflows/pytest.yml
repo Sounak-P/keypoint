@@ -1,0 +1,31 @@
+name: Pytest
+
+on:
+  pull_request:
+  push:
+    branches: [main,ci]
+
+jobs:
+  conda-pytest:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v2
+      - name: install fonts for Pillow
+        run: |
+          sudo apt-get install fonts-freefont-ttf
+      - name: install conda env with micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          channel-priority: strict
+          environment-file: environment.yaml
+          cache-env: true
+          # add hash of environment.yaml and setup.py
+          cache-environment-key: environment-${{ steps.date.outputs.date }} -${{ hashFiles('environment.yaml') }} -${{ hashFiles('setup.py') }}
+          cache-downloads-key: downloads-${{ steps.date.outputs.date }} - ${{ hashFiles('environment.yaml') }} -${{ hashFiles('setup.py') }}
+      - name: Conda list
+        shell: bash -l {0}
+        run: conda list
+      - name: pytest
+        shell: bash -l {0}
+        run: |
+          pytest test/

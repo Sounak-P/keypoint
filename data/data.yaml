@@ -1,0 +1,16 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+kpt_shape: [4, 3]
+flip_idx: [0, 1, 2, 3]
+
+nc: 1
+names: ['corners']
+
+roboflow:
+  workspace: yolov8-paper
+  project: paper-corner-detection-axcjx
+  version: 2
+  license: Public Domain
+  url: https://universe.roboflow.com/yolov8-paper/paper-corner-detection-axcjx/dataset/2
