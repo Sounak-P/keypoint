@@ -109,7 +109,7 @@ def main(args):
             out.write(frame)
             
         if args.out_dir:
-            out_img_path = os.path.join(args.out_dir, f"frame_{frame_idx:06d}.jpg")
+            out_img_path = os.path.join(args.out_dir, f"frame_{frame_idx:06d}.png")
             cv2.imwrite(out_img_path, frame)
             
         frame_idx += 1
