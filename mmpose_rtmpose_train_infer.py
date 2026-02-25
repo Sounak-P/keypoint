@@ -345,7 +345,8 @@ def build_mmpose_config(coco_json_paths: Dict[str, str]):
         },
         joint_info={},
         skeleton_info={},
-        sigmas=np.array([0.05] * Config.NUM_KEYPOINTS),
+        sigmas=[0.05] * Config.NUM_KEYPOINTS,
+        joint_weights=[1.0] * Config.NUM_KEYPOINTS,
     )
 
     # === Model overrides ===
