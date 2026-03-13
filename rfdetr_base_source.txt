@@ -1,0 +1,15 @@
+Methods in RFDETR:
+class_names, deploy_to_roboflow, export, get_model, get_model_config, get_train_config, maybe_download_pretrain_weights, means, optimize_for_inference, predict, remove_optimized_model, size, stds, train, train_from_config
+
+Init signature:
+(self, **kwargs)
+
+Method maybe_download_pretrain_weights signature:
+(self)
+    def maybe_download_pretrain_weights(self):
+        """
+        Download pre-trained weights if they are not already downloaded.
+        """
+        download_pretrain_weights(self.model_config.pretrain_weights)
+
+
