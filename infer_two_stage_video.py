@@ -1,0 +1,857 @@
+"""
+Two-Stage Real-Time Detection Pipeline
+=======================================
+Stage 1 : RFDETR detects the object (works well beyond 5-6 m)
+Stage 2 : UNet keypoint model runs on each RFDETR crop  ← fixes the
+          "can't detect keypoints beyond 2-3 m" problem because the
+          crop always fills the 256×256 input, keeping the target large.
+
+Optimisations for NVIDIA Orin (and any CUDA device):
+  • FP16 (half-precision) inference for both models
+  • Batched UNet forward pass for all detections in one shot
+  • torch.compile if PyTorch ≥ 2.0
+  • RFDETR skip-frame cadence (runs every N frames, reuses boxes in between)
+  • torch.backends.cudnn.benchmark = True
+
+Usage examples
+--------------
+# Process a video file
+python infer_two_stage_video.py \\
+    --rfdetr-weights toTest\\checkpoint_best_total.pth \\
+    --kp-weights     toTest\\final_model.ckpt \\
+    --source         toTest\\video.mp4 \\
+    --output         output_two_stage\\result.mp4 \\
+    --threshold 0.5 --skip-frames 2
+
+# Live webcam (press q to quit)
+python infer_two_stage_video.py \\
+    --rfdetr-weights toTest\\checkpoint_best_total.pth \\
+    --kp-weights     toTest\\final_model.ckpt \\
+    --source 0 --show
+"""
+
+import os
+import sys
+import math
+import time
+import argparse
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict
+
+import numpy as np
+import cv2
+import torch
+import torch.nn as nn
+from torchvision.transforms import functional as TF
+from PIL import Image
+from scipy.ndimage import maximum_filter
+
+# RFDETR / Supervision
+try:
+    from rfdetr import RFDETRBase
+    import supervision as sv
+except ImportError:
+    print("ERROR: rfdetr or supervision not installed. Run:")
+    print("  pip install rfdetr supervision")
+    sys.exit(1)
+
+
+# ===========================================================
+# Configuration
+# ===========================================================
+class TwoStageConfig:
+    # Model paths (overridable via CLI)
+    RFDETR_WEIGHTS: str = r"toTest\checkpoint_best_total.pth"
+    KP_WEIGHTS: str = r"toTest\final_model.ckpt"
+
+    # RFDETR
+    RFDETR_THRESHOLD: float = 0.5
+    RFDETR_SKIP_FRAMES: int = 2          # run RFDETR every (N+1) frames
+
+    # Keypoint model
+    KP_INPUT_SIZE: int = 256
+    NUM_KEYPOINTS: int = 4
+    HEATMAP_SIGMA: int = 3
+    DETECTION_THRESHOLD: float = 0.10
+    MIN_KEYPOINT_DISTANCE: int = 4
+
+    # Crop expansion — adds padding around each RFDETR bbox so corners
+    # right at the edge are not clipped
+    CROP_PAD_RATIO: float = 0.15
+
+    # Speed
+    USE_FP16: bool = True                # half-precision on CUDA
+
+    # Temporal smoothing
+    EMA_ALPHA: float = 0.55
+    MAX_MISSING_FRAMES: int = 4
+
+    # Keypoint names / skeleton for document corners
+    KEYPOINT_NAMES = ["top_left", "top_right", "bottom_right", "bottom_left"]
+    KEYPOINT_SKELETON = [[0, 1], [1, 2], [2, 3], [3, 0]]
+
+    # Colours (BGR)
+    KEYPOINT_COLORS = [
+        (72,   61,  255),   # top_left      – vibrant red-orange
+        (87,  227,  137),   # top_right     – fresh green
+        (255, 182,   56),   # bottom_right  – electric blue
+        (0,   215,  255),   # bottom_left   – golden yellow
+    ]
+    SKELETON_COLOR = (200, 255, 200)
+    BOX_COLOR      = (0,   200, 255)
+
+
+# ===========================================================
+# U-Net backbone  (identical to infer_video_keypoints.py)
+# ===========================================================
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch,  out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels: int = 3, base_channels: int = 64):
+        super().__init__()
+        b = base_channels
+        self.enc1 = DoubleConv(in_channels, b)
+        self.enc2 = DoubleConv(b,     b * 2)
+        self.enc3 = DoubleConv(b * 2, b * 4)
+        self.enc4 = DoubleConv(b * 4, b * 8)
+        self.pool = nn.MaxPool2d(2)
+        self.bottleneck = DoubleConv(b * 8, b * 16)
+        self.up4  = nn.ConvTranspose2d(b * 16, b * 8, 2, stride=2)
+        self.dec4 = DoubleConv(b * 16, b * 8)
+        self.up3  = nn.ConvTranspose2d(b * 8,  b * 4, 2, stride=2)
+        self.dec3 = DoubleConv(b * 8,  b * 4)
+        self.up2  = nn.ConvTranspose2d(b * 4,  b * 2, 2, stride=2)
+        self.dec2 = DoubleConv(b * 4,  b * 2)
+        self.up1  = nn.ConvTranspose2d(b * 2,  b,     2, stride=2)
+        self.dec1 = DoubleConv(b * 2,  b)
+        self.out_channels = b
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b  = self.bottleneck(self.pool(e4))
+        d4 = self.dec4(torch.cat([self.up4(b),  e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return d1
+
+
+class KeypointDetector(nn.Module):
+    """Lightweight wrapper identical in structure to the trained model."""
+    def __init__(self, n_keypoints: int = 4):
+        super().__init__()
+        self.backbone = UNet(in_channels=3, base_channels=64)
+        self.head = nn.Conv2d(self.backbone.out_channels, n_keypoints, kernel_size=1)
+
+    def forward(self, x):
+        return torch.sigmoid(self.head(self.backbone(x)))
+
+
+# ===========================================================
+# Model loaders
+# ===========================================================
+def load_rfdetr(weights: str, device: str) -> RFDETRBase:
+    """Load RFDETR with pretrained weights and inference optimisation."""
+    print(f"[RFDETR] Loading from: {weights}")
+    model = RFDETRBase(pretrain_weights=weights)
+    model.optimize_for_inference()
+    print(f"[RFDETR] Ready  (device managed internally by rfdetr lib)")
+    return model
+
+
+def load_keypoint_model(ckpt_path: str, device: str,
+                        use_fp16: bool) -> KeypointDetector:
+    """
+    Load the Lightning checkpoint into the plain nn.Module detector.
+    Handles both:
+      • .pth  files (raw state_dict or {'state_dict': ...})
+      • .ckpt files (Lightning checkpoint with 'state_dict' key)
+    """
+    print(f"[UNet]   Loading from: {ckpt_path}")
+    model = KeypointDetector(n_keypoints=TwoStageConfig.NUM_KEYPOINTS)
+
+    raw = torch.load(ckpt_path, map_location="cpu")
+    sd  = raw.get("state_dict", raw)          # unwrap Lightning wrapper
+
+    # Strip leading 'model.' prefix inserted by Lightning
+    sd_clean = {k.removeprefix("model."): v for k, v in sd.items()}
+
+    model.load_state_dict(sd_clean, strict=True)
+    model.eval()
+
+    if use_fp16 and device == "cuda":
+        model = model.half()
+
+    model = model.to(device)
+
+    # Apply torch.compile only on CUDA — the default 'inductor' backend on
+    # Windows requires MSVC cl.exe which is often absent.  On CUDA we use
+    # the 'eager' backend (no C++ compiler needed).  On CPU we skip entirely.
+    if hasattr(torch, "compile") and device == "cuda":
+        try:
+            model = torch.compile(model, backend="eager")
+            print("[UNet]   torch.compile(backend='eager') applied")
+        except Exception as e:
+            print(f"[UNet]   torch.compile() skipped: {e}")
+
+    dtype_str = "FP16" if (use_fp16 and device == "cuda") else "FP32"
+    n_params  = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"[UNet]   Ready on {device} ({dtype_str}) | {n_params:.1f}M params")
+    return model
+
+
+# ===========================================================
+# Crop helpers
+# ===========================================================
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def crop_for_bbox(
+    frame_rgb: np.ndarray,
+    bbox_xyxy: np.ndarray,
+    pad_ratio: float = 0.15,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Crop a padded region around a bbox from the full frame.
+
+    Returns
+    -------
+    crop_rgb : np.ndarray  H×W×3 uint8
+    meta     : dict with keys x0,y0,x1,y1 in full-frame pixels
+    """
+    fh, fw = frame_rgb.shape[:2]
+    x0, y0, x1, y1 = bbox_xyxy.astype(int)
+
+    bw  = x1 - x0
+    bh  = y1 - y0
+    pad = int(max(bw, bh) * pad_ratio)
+
+    x0p = _clamp(x0 - pad, 0, fw - 1)
+    y0p = _clamp(y0 - pad, 0, fh - 1)
+    x1p = _clamp(x1 + pad, 1, fw)
+    y1p = _clamp(y1 + pad, 1, fh)
+
+    crop = frame_rgb[y0p:y1p, x0p:x1p]
+    meta = {"x0": x0p, "y0": y0p, "x1": x1p, "y1": y1p,
+            "fw": fw,  "fh": fh}
+    return crop, meta
+
+
+def remap_keypoints(kps_in_crop, meta: Dict) -> List[Optional[Tuple[int, int, float]]]:
+    """
+    Map keypoints from crop-space coordinates back to full-frame coordinates.
+
+    kps_in_crop : list of (cx, cy, conf) or None — in [0..KP_INPUT_SIZE]
+    Returns     : list of (fx, fy, conf) or None — in full-frame pixels
+    """
+    cx0, cy0 = meta["x0"], meta["y0"]
+    crop_w   = meta["x1"] - meta["x0"]
+    crop_h   = meta["y1"] - meta["y0"]
+    sx       = crop_w / TwoStageConfig.KP_INPUT_SIZE
+    sy       = crop_h / TwoStageConfig.KP_INPUT_SIZE
+
+    out = []
+    for kp in kps_in_crop:
+        if kp is None:
+            out.append(None)
+        else:
+            fx = int(kp[0] * sx) + cx0
+            fy = int(kp[1] * sy) + cy0
+            out.append((fx, fy, kp[2]))
+    return out
+
+
+# ===========================================================
+# Keypoint extraction from heatmap
+# ===========================================================
+def extract_keypoints_from_heatmap(
+    hm: np.ndarray,                     # (C, H, W) float32
+    threshold: float = 0.10,
+    min_distance: int = 4,
+) -> List[Optional[Tuple[int, int, float]]]:
+    """Return the single best (x, y, conf) per channel, or None."""
+    results = []
+    for ch in range(hm.shape[0]):
+        channel   = hm[ch]
+        local_max = maximum_filter(channel, size=min_distance * 2 + 1)
+        peaks     = (channel == local_max) & (channel > threshold)
+        coords    = np.where(peaks)
+        if len(coords[0]) == 0:
+            results.append(None)
+            continue
+        vals = channel[coords]
+        idx  = np.argmax(vals)
+        y, x = int(coords[0][idx]), int(coords[1][idx])
+        results.append((x, y, float(vals[idx])))
+    return results
+
+
+# ===========================================================
+# Batched UNet inference over all crops
+# ===========================================================
+def infer_keypoints_batch(
+    model: KeypointDetector,
+    crops_rgb: List[np.ndarray],
+    device: str,
+    use_fp16: bool,
+    input_size: int = 256,
+) -> List[np.ndarray]:
+    """
+    Run UNet on a list of crops in ONE batched forward pass.
+
+    Returns list of heatmap arrays, shape (C, H, W) float32 each.
+    """
+    if not crops_rgb:
+        return []
+
+    tensors = []
+    for crop in crops_rgb:
+        pil = Image.fromarray(crop).resize((input_size, input_size), Image.BILINEAR)
+        t   = TF.to_tensor(pil)  # float32  [0,1]
+        tensors.append(t)
+
+    batch = torch.stack(tensors)         # (N, 3, H, W)
+
+    if use_fp16 and device == "cuda":
+        batch = batch.half()
+
+    batch = batch.to(device)
+
+    with torch.no_grad():
+        heatmaps = model(batch)          # (N, C, H, W)
+
+    heatmaps_np = heatmaps.float().cpu().numpy()
+    return [heatmaps_np[i] for i in range(len(crops_rgb))]
+
+
+# ===========================================================
+# Per-object temporal smoother
+# ===========================================================
+class ObjectTracker:
+    """
+    Tracks keypoints for a single detected object across frames using EMA.
+    Supports up to `max_missing` consecutive frames with no detection.
+    """
+    def __init__(self, n_kp: int = 4, alpha: float = 0.55, max_missing: int = 4):
+        self.n_kp        = n_kp
+        self.alpha       = alpha
+        self.max_missing = max_missing
+        self.smooth: List[Optional[Tuple[float, float, float]]] = [None] * n_kp
+        self.missing:  List[int] = [0] * n_kp
+
+    def update(self, raw: List[Optional[Tuple[int, int, float]]]):
+        out, vis = [], []
+        for i, kp in enumerate(raw):
+            if kp is not None:
+                self.missing[i] = 0
+                if self.smooth[i] is None:
+                    self.smooth[i] = (float(kp[0]), float(kp[1]), kp[2])
+                else:
+                    a = self.alpha
+                    sx = a * kp[0] + (1 - a) * self.smooth[i][0]
+                    sy = a * kp[1] + (1 - a) * self.smooth[i][1]
+                    sc = a * kp[2] + (1 - a) * self.smooth[i][2]
+                    self.smooth[i] = (sx, sy, sc)
+                out.append((int(self.smooth[i][0]), int(self.smooth[i][1]),
+                            self.smooth[i][2]))
+                vis.append(True)
+            else:
+                self.missing[i] += 1
+                if self.smooth[i] is not None and self.missing[i] <= self.max_missing:
+                    decay = max(0.3, 1.0 - 0.2 * self.missing[i])
+                    out.append((int(self.smooth[i][0]), int(self.smooth[i][1]),
+                                self.smooth[i][2] * decay))
+                    vis.append(False)
+                else:
+                    self.smooth[i] = None
+                    out.append(None)
+                    vis.append(False)
+        return out, vis
+
+
+# ===========================================================
+# Multi-object tracker registry
+# ===========================================================
+class MultiObjectTrackerRegistry:
+    """
+    Maintains one ObjectTracker per detected bounding box.
+    Uses IoU matching to associate boxes across frames.
+    """
+    def __init__(self, n_kp: int = 4, iou_threshold: float = 0.35):
+        self.iou_threshold = iou_threshold
+        self.n_kp          = n_kp
+        self._trackers: Dict[int, ObjectTracker] = {}
+        self._boxes:    Dict[int, np.ndarray]    = {}
+        self._next_id  = 0
+
+    # ---- IoU ---------------------------------------------------
+    @staticmethod
+    def _iou(a: np.ndarray, b: np.ndarray) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+        iw  = max(0.0, ix2 - ix1)
+        ih  = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        area_a = max(1e-6, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1e-6, (bx2 - bx1) * (by2 - by1))
+        return inter / (area_a + area_b - inter)
+
+    def match_and_update(
+        self,
+        new_boxes: np.ndarray,          # (N,4)  xyxy
+        new_kps:   List[List[Optional[Tuple[int, int, float]]]],
+    ) -> List[Tuple[int, np.ndarray,
+                    List[Optional[Tuple[int, int, float]]],
+                    List[bool]]]:
+        """
+        Returns list of (track_id, box, smoothed_kps, visibility_flags).
+        """
+        if len(new_boxes) == 0:
+            return []
+
+        existing_ids  = list(self._trackers.keys())
+        matched_exist = set()
+        assignments   = {}
+
+        for ni, nb in enumerate(new_boxes):
+            best_iou = self.iou_threshold
+            best_eid = None
+            for eid in existing_ids:
+                if eid in matched_exist:
+                    continue
+                iou = self._iou(nb, self._boxes[eid])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_eid = eid
+            assignments[ni] = best_eid
+            if best_eid is not None:
+                matched_exist.add(best_eid)
+
+        # Retire unmatched existing trackers (object left the scene)
+        for eid in existing_ids:
+            if eid not in matched_exist:
+                del self._trackers[eid]
+                del self._boxes[eid]
+
+        results = []
+        for ni, nb in enumerate(new_boxes):
+            eid = assignments[ni]
+            if eid is None:
+                # New object – create tracker
+                eid = self._next_id
+                self._next_id += 1
+                self._trackers[eid] = ObjectTracker(
+                    n_kp=self.n_kp,
+                    alpha=TwoStageConfig.EMA_ALPHA,
+                    max_missing=TwoStageConfig.MAX_MISSING_FRAMES,
+                )
+
+            self._boxes[eid] = nb
+            kps_s, vis = self._trackers[eid].update(new_kps[ni])
+            results.append((eid, nb, kps_s, vis))
+
+        return results
+
+
+# ===========================================================
+# Drawing helpers
+# ===========================================================
+def _blend(dst, src, alpha):
+    cv2.addWeighted(src, alpha, dst, 1 - alpha, 0, dst)
+
+
+def _rounded_rect(img, pt1, pt2, color, r=10, filled=True, alpha=0.75):
+    over = img.copy()
+    x1, y1 = pt1
+    x2, y2 = pt2
+    r = min(r, (x2 - x1) // 2, (y2 - y1) // 2)
+    cv2.rectangle(over, (x1 + r, y1), (x2 - r, y2), color, -1 if filled else 1)
+    cv2.rectangle(over, (x1, y1 + r), (x2, y2 - r), color, -1 if filled else 1)
+    for cx, cy in [(x1 + r, y1 + r), (x2 - r, y1 + r),
+                   (x1 + r, y2 - r), (x2 - r, y2 - r)]:
+        cv2.circle(over, (cx, cy), r, color, -1 if filled else 1)
+    _blend(img, over, alpha)
+
+
+def _dashed_line(img, p1, p2, color, thickness=2, dash=12):
+    x1, y1 = p1
+    x2, y2 = p2
+    dx, dy = x2 - x1, y2 - y1
+    L = math.hypot(dx, dy)
+    if L == 0:
+        return
+    ux, uy = dx / L, dy / L
+    d, on = 0.0, True
+    while d < L:
+        seg = min(dash, L - d)
+        sx, sy = int(x1 + ux * d), int(y1 + uy * d)
+        ex, ey = int(x1 + ux * (d + seg)), int(y1 + uy * (d + seg))
+        if on:
+            cv2.line(img, (sx, sy), (ex, ey), color, thickness, cv2.LINE_AA)
+        on = not on
+        d += seg
+
+
+def draw_results(
+    frame: np.ndarray,
+    tracks,          # output of MultiObjectTrackerRegistry.match_and_update
+    fps:  float,
+    frame_idx: int,
+    total_frames: int,
+) -> None:
+    """Render boxes, keypoints, skeleton and HUD onto `frame` in-place."""
+    h, w = frame.shape[:2]
+    cfg  = TwoStageConfig
+
+    overlay = frame.copy()
+    for tid, box, kps, vis in tracks:
+        bx0, by0, bx1, by1 = box.astype(int)
+
+        # ── Detection box ──────────────────────────────────────
+        cv2.rectangle(overlay, (bx0, by0), (bx1, by1), cfg.BOX_COLOR, 2, cv2.LINE_AA)
+        label = f"ID:{tid}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        _rounded_rect(overlay, (bx0, by0 - th - 10), (bx0 + tw + 10, by0),
+                      (20, 20, 20), r=4, alpha=0.75)
+        cv2.putText(overlay, label, (bx0 + 5, by0 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, cfg.BOX_COLOR, 1, cv2.LINE_AA)
+
+        # ── Skeleton lines ─────────────────────────────────────
+        for i, j in cfg.KEYPOINT_SKELETON:
+            if kps[i] is not None and kps[j] is not None:
+                p1 = (kps[i][0], kps[i][1])
+                p2 = (kps[j][0], kps[j][1])
+                if vis[i] and vis[j]:
+                    cv2.line(overlay, p1, p2, cfg.SKELETON_COLOR, 3, cv2.LINE_AA)
+                else:
+                    _dashed_line(overlay, p1, p2, (180, 180, 180), 2)
+
+        # ── Keypoint circles ───────────────────────────────────
+        r_kp = max(7, min(w, h) // 90)
+        for ki, kp in enumerate(kps):
+            if kp is None:
+                continue
+            cx, cy, conf = kp
+            color = cfg.KEYPOINT_COLORS[ki]
+            if vis[ki]:
+                gl = frame.copy()
+                for r_off, a in [(r_kp + 8, 0.15), (r_kp + 4, 0.25)]:
+                    cv2.circle(gl, (cx, cy), r_off, color, -1, cv2.LINE_AA)
+                    _blend(frame, gl, a)
+                cv2.circle(frame, (cx, cy), r_kp, color, -1, cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), r_kp, (255, 255, 255), 2, cv2.LINE_AA)
+            else:
+                cv2.circle(frame, (cx, cy), r_kp, color, 2, cv2.LINE_AA)
+
+            # Small label pill
+            name = cfg.KEYPOINT_NAMES[ki]
+            lbl  = f"{name} {conf:.0%}"
+            (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+            lx, ly = cx + r_kp + 6, cy - r_kp
+            if lx + lw + 10 > w:
+                lx = cx - r_kp - lw - 16
+            if ly - lh - 6 < 0:
+                ly = cy + r_kp + lh + 8
+            _rounded_rect(frame, (lx - 4, ly - lh - 6), (lx + lw + 6, ly + 4),
+                          (20, 20, 20), r=5, alpha=0.7)
+            cv2.putText(frame, lbl, (lx, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
+
+    # Blend the detection boxes over the frame
+    _blend(frame, overlay, 0.75)
+
+    # ── FPS badge (top-right) ───────────────────────────────────
+    fps_str = f"{fps:.1f} FPS"
+    (fw2, fh2), _ = cv2.getTextSize(fps_str, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    bw2 = fw2 + 24
+    _rounded_rect(frame, (w - bw2 - 10, 10), (w - 10, fh2 + 30),
+                  (30, 30, 30), r=8, alpha=0.80)
+    cv2.putText(frame, fps_str, (w - bw2, fh2 + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (87, 227, 137), 2, cv2.LINE_AA)
+
+    # ── Status bar (bottom) ─────────────────────────────────────
+    n_obj  = len(tracks)
+    n_kp_d = sum(sum(1 for k in kps if k is not None) for _, _, kps, _ in tracks)
+    status = (f"  Frame {frame_idx + 1}/{total_frames}  |  "
+              f"Objects: {n_obj}  |  Keypoints: {n_kp_d}")
+
+    bar_h = 34
+    bar_layer = frame.copy()
+    cv2.rectangle(bar_layer, (0, h - bar_h), (w, h), (30, 30, 30), -1)
+    _blend(frame, bar_layer, 0.75)
+    cv2.line(frame, (0, h - bar_h), (w, h - bar_h), (0, 220, 255), 2)
+    cv2.putText(frame, status, (10, h - 9),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (240, 240, 240), 1, cv2.LINE_AA)
+
+
+# ===========================================================
+# Main pipeline
+# ===========================================================
+def main():
+    ap = argparse.ArgumentParser(
+        description="Two-stage RFDETR + UNet keypoint pipeline (real-time ready)"
+    )
+    ap.add_argument("--rfdetr-weights", default=TwoStageConfig.RFDETR_WEIGHTS,
+                    help="Path to RFDETR checkpoint (.pth)")
+    ap.add_argument("--kp-weights", default=TwoStageConfig.KP_WEIGHTS,
+                    help="Path to UNet keypoint checkpoint (.ckpt or .pth)")
+    ap.add_argument("--source", default=r"toTest\video.mp4",
+                    help="Video path or camera index (0,1,...)")
+    ap.add_argument("--output", default=r"output_two_stage\result.mp4",
+                    help="Output video path (ignored when --show-only)")
+    ap.add_argument("--threshold", type=float, default=TwoStageConfig.RFDETR_THRESHOLD,
+                    help="RFDETR confidence threshold")
+    ap.add_argument("--skip-frames", type=int, default=TwoStageConfig.RFDETR_SKIP_FRAMES,
+                    help="Run RFDETR every (N+1) frames; reuse boxes in between")
+    ap.add_argument("--pad-ratio", type=float, default=TwoStageConfig.CROP_PAD_RATIO,
+                    help="Fractional padding added around each crop bbox")
+    ap.add_argument("--no-fp16", action="store_true",
+                    help="Disable FP16 (use FP32 for keypoint model)")
+    ap.add_argument("--show", action="store_true",
+                    help="Display live OpenCV window (press q to quit)")
+    args = ap.parse_args()
+
+    # --- resolve paths relative to script location
+    script_dir = Path(__file__).parent
+    rfdetr_weights = Path(args.rfdetr_weights)
+    kp_weights     = Path(args.kp_weights)
+    if not rfdetr_weights.is_absolute():
+        rfdetr_weights = script_dir / rfdetr_weights
+    if not kp_weights.is_absolute():
+        kp_weights = script_dir / kp_weights
+
+    use_fp16 = not args.no_fp16
+
+    print("=" * 70)
+    print("   TWO-STAGE RFDETR + UNET KEYPOINT PIPELINE")
+    print("=" * 70)
+
+    # --- Validate weights
+    for p, name in [(rfdetr_weights, "RFDETR"), (kp_weights, "Keypoint")]:
+        if not p.exists():
+            print(f"ERROR: {name} weights not found: {p}")
+            sys.exit(1)
+
+    # --- Device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device : {device}")
+    if device == "cuda":
+        print(f"GPU    : {torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True
+
+    if use_fp16 and device != "cuda":
+        print("WARN: FP16 requires CUDA — falling back to FP32")
+        use_fp16 = False
+
+    # --- Load models
+    rfdetr_model = load_rfdetr(str(rfdetr_weights), device)
+    kp_model     = load_keypoint_model(str(kp_weights), device, use_fp16)
+
+    # --- Supervision annotators (used only for boxing the raw detections)
+    # We draw everything manually for tighter control
+
+    # --- Open source
+    src_arg = args.source
+    try:
+        cam_idx = int(src_arg)
+        cap = cv2.VideoCapture(cam_idx)
+        is_webcam    = True
+        total_frames = 0  # unknown
+    except ValueError:
+        src_path = Path(src_arg)
+        if not src_path.is_absolute():
+            src_path = script_dir / src_path
+        if not src_path.exists():
+            print(f"ERROR: Source not found: {src_path}")
+            sys.exit(1)
+        cap = cv2.VideoCapture(str(src_path))
+        is_webcam    = False
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if not cap.isOpened():
+        print("ERROR: Cannot open video source")
+        sys.exit(1)
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    vw      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vh      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Source : {vw}×{vh} @ {src_fps:.1f} fps  {'(webcam)' if is_webcam else f'| {total_frames} frames'}")
+    print(f"FP16   : {use_fp16}  |  Skip frames: {args.skip_frames}")
+    print(f"Pad    : {args.pad_ratio:.0%}  |  Threshold: {args.threshold}")
+    print()
+
+    # --- Writer
+    writer = None
+    if not is_webcam or args.output:
+        out_path = Path(args.output)
+        if not out_path.is_absolute():
+            out_path = script_dir / out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(out_path), fourcc, src_fps, (vw, vh))
+        if not writer.isOpened():
+            print("WARN: mp4v failed – trying XVID")
+            out_path = out_path.with_suffix(".avi")
+            fourcc   = cv2.VideoWriter_fourcc(*"XVID")
+            writer   = cv2.VideoWriter(str(out_path), fourcc, src_fps, (vw, vh))
+        print(f"Output : {out_path}")
+
+    # --- Tracker registry
+    registry = MultiObjectTrackerRegistry(n_kp=TwoStageConfig.NUM_KEYPOINTS)
+
+    # --- State for skip-frame reuse
+    last_detections: Optional[sv.Detections] = None
+
+    # --- Warm-up (10 frames)
+    print("Warming up…")
+    warmup_counts = 0
+    warmup_t0     = time.perf_counter()
+    while warmup_counts < 10:
+        ret, wframe = cap.read()
+        if not ret:
+            break
+        try:
+            wrgb = cv2.cvtColor(wframe, cv2.COLOR_BGR2RGB)
+            det  = rfdetr_model.predict(Image.fromarray(wrgb),
+                                        threshold=args.threshold)
+            if det is not None and len(det) > 0:
+                bboxes = det.xyxy[:1]          # just one crop for warmup
+                crop, _ = crop_for_bbox(wrgb, bboxes[0], args.pad_ratio)
+                infer_keypoints_batch(kp_model, [crop], device, use_fp16,
+                                      TwoStageConfig.KP_INPUT_SIZE)
+        except Exception:
+            pass
+        warmup_counts += 1
+    warmup_dt = time.perf_counter() - warmup_t0
+    print(f"Warmup done ({warmup_counts} frames in {warmup_dt:.2f}s → "
+          f"{warmup_counts/warmup_dt:.1f} fps)\n")
+
+    # Reset to start for file-based sources
+    if not is_webcam:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    frame_idx = 0
+    fps_ema   = 0.0
+    t_start   = time.perf_counter()
+
+    print(f"Processing {'live stream' if is_webcam else f'{total_frames} frames'} …")
+
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+
+        t0 = time.perf_counter()
+
+        # ── Stage 1: RFDETR object detection ────────────────────────────
+        run_rfdetr = (args.skip_frames == 0 or
+                      frame_idx % (args.skip_frames + 1) == 0)
+
+        if run_rfdetr:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            try:
+                last_detections = rfdetr_model.predict(
+                    Image.fromarray(frame_rgb), threshold=args.threshold
+                )
+            except Exception as e:
+                print(f"  [frame {frame_idx}] RFDETR error: {e}")
+                last_detections = None
+        else:
+            # Reuse previous detections (still need the RGB conversion)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        # ── Stage 2: UNet keypoints on crops ────────────────────────────
+        tracks = []
+        if last_detections is not None and len(last_detections) > 0:
+            bboxes = last_detections.xyxy  # (N, 4) float32 xyxy
+
+            # Build crops for all detected objects
+            crops_rgb  = []
+            crops_meta = []
+            for bbox in bboxes:
+                crop, meta = crop_for_bbox(frame_rgb, bbox, args.pad_ratio)
+                crops_rgb.append(crop)
+                crops_meta.append(meta)
+
+            # ONE batched forward pass for all crops
+            heatmaps_list = infer_keypoints_batch(
+                kp_model, crops_rgb, device, use_fp16,
+                TwoStageConfig.KP_INPUT_SIZE,
+            )
+
+            # Extract & remap keypoints per detection
+            all_kps_frame = []
+            for hm, meta in zip(heatmaps_list, crops_meta):
+                kps_crop  = extract_keypoints_from_heatmap(
+                    hm,
+                    TwoStageConfig.DETECTION_THRESHOLD,
+                    TwoStageConfig.MIN_KEYPOINT_DISTANCE,
+                )
+                kps_frame = remap_keypoints(kps_crop, meta)
+                all_kps_frame.append(kps_frame)
+
+            # Update tracker registry (IoU matching + EMA smoothing)
+            tracks = registry.match_and_update(bboxes, all_kps_frame)
+
+        # ── Render ───────────────────────────────────────────────────────
+        draw_results(frame_bgr, tracks, fps_ema, frame_idx,
+                     total_frames if not is_webcam else frame_idx + 1)
+
+        # ── Output ───────────────────────────────────────────────────────
+        if writer is not None:
+            writer.write(frame_bgr)
+
+        if args.show:
+            cv2.imshow("Two-Stage Pipeline  [q to quit]", frame_bgr)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+        # ── FPS ──────────────────────────────────────────────────────────
+        dt      = time.perf_counter() - t0
+        inst    = 1.0 / dt if dt > 0 else 0.0
+        fps_ema = 0.3 * inst + 0.7 * fps_ema if fps_ema > 0 else inst
+
+        if frame_idx % 50 == 0 or (not is_webcam and frame_idx == total_frames - 1):
+            n_det = len(last_detections) if last_detections is not None else 0
+            print(f"  [{frame_idx + 1}{'/' + str(total_frames) if not is_webcam else ''}] "
+                  f"{fps_ema:.1f} fps  |  detections: {n_det}")
+
+        frame_idx += 1
+
+    cap.release()
+    if writer is not None:
+        writer.release()
+    if args.show:
+        cv2.destroyAllWindows()
+
+    total_time = time.perf_counter() - t_start
+    avg_fps    = frame_idx / total_time if total_time > 0 else 0
+    print(f"\n{'=' * 70}")
+    print(f"  DONE — {frame_idx} frames in {total_time:.1f}s  ({avg_fps:.1f} avg fps)")
+    if writer is not None:
+        print(f"  Output : {out_path}")
+    print(f"{'=' * 70}")
+
+
+if __name__ == "__main__":
+    main()
