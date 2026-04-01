@@ -417,8 +417,9 @@ class CropAwareKeypointDataset(Dataset):
 
     def _parse_keypoints(self, ann, meta):
         """
-        Parse COCO keypoints, remap into crop-space, then scale to input_size.
-        Returns list of [x_scaled, y_scaled] or [-1,-1] if invisible.
+        Parse COCO keypoints, remap into crop-pixel space.
+        Returns list of [cx, cy] in crop-pixel coordinates or [-1,-1] if invisible.
+        Scaling to input_size is handled later by the augmentation pipeline.
         """
         kps_flat = ann["keypoints"]
         cw, ch   = meta["cw"], meta["ch"]
@@ -434,15 +435,12 @@ class CropAwareKeypointDataset(Dataset):
             if vis <= 0:
                 result.append([-1.0, -1.0])
                 continue
-            # to crop-space
+            # to crop-pixel space (NOT scaled to input_size yet)
             cx = kx - x0
             cy = ky - y0
-            # to scaled space [0, input_size]
-            sx = (cx / cw) * self.input_size
-            sy = (cy / ch) * self.input_size
-            # only keep if within crop
-            if 0 <= sx <= self.input_size and 0 <= sy <= self.input_size:
-                result.append([sx, sy])
+            # only keep if within crop bounds
+            if 0 <= cx <= cw and 0 <= cy <= ch:
+                result.append([float(cx), float(cy)])
             else:
                 result.append([-1.0, -1.0])
         return result
@@ -492,9 +490,18 @@ class CropAwareKeypointDataset(Dataset):
         return img_t, final_kps
 
     # ── basic transform path ──────────────────────────────────────────────────
-    def _apply_basic(self, crop_np, kps_scaled):
-        img_t, _ = self._transform(crop_np, kps_scaled)
-        return img_t, kps_scaled   # kps already in [0, input_size] space
+    def _apply_basic(self, crop_np, kps_crop):
+        h, w = crop_np.shape[:2]
+        img_t, _ = self._transform(crop_np, kps_crop)
+        # Manually scale keypoints from crop-pixel space to input_size space
+        scaled = []
+        for kp in kps_crop:
+            if kp[0] < 0:
+                scaled.append([-1.0, -1.0])
+            else:
+                scaled.append([kp[0] / w * self.input_size,
+                               kp[1] / h * self.input_size])
+        return img_t, scaled
 
     # ── __getitem__ ───────────────────────────────────────────────────────────
     def __len__(self):
@@ -677,6 +684,67 @@ def save_prediction_grid(imgs, hm_preds, hm_gts, save_path, n=4):
     print(f"  Saved: {save_path}")
 
 
+def save_sample_overlays(dataset, save_dir, n_samples=5):
+    """
+    Save N individual sample visualizations with GT heatmap overlaid on the
+    input crop.  Each image has 3 panels:
+      [Input crop]  |  [GT heatmap]  |  [Overlay + keypoint markers]
+    This makes alignment issues immediately obvious before training starts.
+    """
+    n_samples = min(n_samples, len(dataset))
+    mean = np.array([0.485, 0.456, 0.406])
+    std  = np.array([0.229, 0.224, 0.225])
+    kp_colors = ["red", "lime", "deepskyblue", "gold"]
+
+    for si in range(n_samples):
+        img_t, hm_t = dataset[si]
+
+        # De-normalise image
+        img_np = img_t.permute(1, 2, 0).numpy()
+        img_np = np.clip(img_np * std + mean, 0, 1)
+
+        hm_np  = hm_t.numpy()                       # (C, H, W)
+        hm_max = np.max(hm_np, axis=0)               # (H, W)
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Panel 1: Input crop
+        axes[0].imshow(img_np)
+        axes[0].set_title(f"Sample {si} — Input crop", fontsize=10)
+        axes[0].axis("off")
+
+        # Panel 2: GT heatmap alone
+        axes[1].imshow(hm_max, cmap="hot", vmin=0, vmax=1)
+        axes[1].set_title("GT heatmap (max)", fontsize=10)
+        axes[1].axis("off")
+
+        # Panel 3: Overlay — crop + heatmap blend + keypoint markers
+        axes[2].imshow(img_np)
+        axes[2].imshow(hm_max, cmap="hot", alpha=0.45, vmin=0, vmax=1)
+        for ki in range(hm_np.shape[0]):
+            ch = hm_np[ki]
+            if ch.max() < 0.1:
+                continue
+            # Find peak location
+            peak_yx = np.unravel_index(np.argmax(ch), ch.shape)
+            py, px = peak_yx
+            label = KEYPOINT_NAMES[ki] if ki < len(KEYPOINT_NAMES) else f"kp{ki}"
+            axes[2].plot(px, py, 'o', color=kp_colors[ki % len(kp_colors)],
+                         markersize=10, markeredgecolor='white', markeredgewidth=1.5)
+            axes[2].text(px + 6, py - 6, label, fontsize=7,
+                         color=kp_colors[ki % len(kp_colors)],
+                         fontweight='bold',
+                         bbox=dict(boxstyle='round,pad=0.2', fc='black', alpha=0.6))
+        axes[2].set_title("Overlay: crop + GT heatmap + KP", fontsize=10)
+        axes[2].axis("off")
+
+        plt.tight_layout()
+        path = os.path.join(save_dir, f"sanity_sample_{si}.png")
+        plt.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close()
+        print(f"  Saved: {path}")
+
+
 def plot_training_curves(train_losses, val_losses, save_path):
     if not train_losses:
         return
@@ -804,8 +872,14 @@ def main():
         persistent_workers=(Config.NUM_WORKERS > 0),
     )
 
-    # Sanity-check one batch
-    print("  Sanity check — loading one train batch...")
+    # ── Sanity-check: per-sample overlay visualizations ────────────────────
+    n_sanity = min(5, len(train_ds))   # 2-5 samples for quick visual check
+    print(f"  Sanity check — saving {n_sanity} sample overlays...")
+    print("  (Check these images in outputs_cropped/visualizations/ before")
+    print("   letting the full training run — terminate early if misaligned.)")
+    save_sample_overlays(train_ds, Config.VIS_DIR, n_samples=n_sanity)
+
+    # Also log tensor shapes from one batch
     sample_imgs, sample_hms = next(iter(train_loader))
     print(f"  Image tensor : {tuple(sample_imgs.shape)} {sample_imgs.dtype}")
     print(f"  Heatmap tensor: {tuple(sample_hms.shape)} "
